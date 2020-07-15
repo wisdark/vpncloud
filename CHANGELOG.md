@@ -2,16 +2,27 @@
 
 This project follows [semantic versioning](http://semver.org).
 
+
 ### UNRELEASED
 
+- [added] Added crypto option AES128
+- [added] Default port for peers
+- [changed] Updated dependencies
+- [fixed] Fixed keepalive for small timeouts
+
+### v1.4.0 (2020-06-03)
+
 - [added] Added option to listen on specified IP
+- [added] Added support for statsd monitoring
 - [changed] No longer using two sockets for ipv4 and ipv6
 - [changed] Warning for missing router is now info
 - [changed] New warning on claimed addresses in learning mode
-- [changed] Updated dependencies
 - [changed] Rewrote argument parsing
+- [changed] Changed stats file format to YAML
+- [changed] Using asciidoc for manpage
+- [changed] Updated dependencies
 - [fixed] Fixed problem that could lead to 100% cpu consumption
-
+- [fixed] Fixed startup race condition
 
 ### v1.3.0 (2020-01-25)
 
