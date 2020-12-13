@@ -2,39 +2,43 @@
 // Copyright (C) 2015-2020  Dennis Schwerdel
 // This software is licensed under GPL-3 or newer (see LICENSE.md)
 
-use libc::{c_short, c_ulong, ioctl, IFF_NO_PI, IFF_TAP, IFF_TUN, IF_NAMESIZE};
 use std::{
+    cmp,
     collections::VecDeque,
-    fmt, fs,
-    io::{self, Error as IoError, ErrorKind, Read, Write},
+    fmt,
+    fs::{self, File},
+    io::{self, BufRead, BufReader, Cursor, Error as IoError, Read, Write},
+    net::{Ipv4Addr, UdpSocket},
     os::unix::io::{AsRawFd, RawFd},
+    convert::TryInto,
     str,
     str::FromStr
 };
 
-use super::types::Error;
+use crate::{crypto, error::Error, util::MsgBuffer};
 
-static TUNSETIFF: c_ulong = 1074025674;
-
+static TUNSETIFF: libc::c_ulong = 1074025674;
 
 #[repr(C)]
 union IfReqData {
-    flags: c_short,
+    flags: libc::c_short,
+    value: libc::c_int,
+    addr: (libc::c_short, Ipv4Addr),
     _dummy: [u8; 24]
 }
 
 #[repr(C)]
 struct IfReq {
-    ifr_name: [u8; IF_NAMESIZE],
-    data: IfReqData    
+    ifr_name: [u8; libc::IF_NAMESIZE],
+    data: IfReqData
 }
 
 impl IfReq {
-    fn new(name: &str, flags: c_short) -> Self {
-        assert!(name.len() < IF_NAMESIZE);
-        let mut ifr_name = [0 as u8; IF_NAMESIZE];
+    fn new(name: &str) -> Self {
+        assert!(name.len() < libc::IF_NAMESIZE);
+        let mut ifr_name = [0 as u8; libc::IF_NAMESIZE];
         ifr_name[..name.len()].clone_from_slice(name.as_bytes());
-        Self { ifr_name, data: IfReqData { flags } }
+        Self { ifr_name, data: IfReqData { _dummy: [0; 24] } }
     }
 }
 
@@ -47,18 +51,14 @@ pub enum Type {
     Tun,
     /// Tap interface: This interface transports Ethernet frames.
     #[serde(rename = "tap")]
-    Tap,
-    /// Dummy interface: This interface does nothing.
-    #[serde(rename = "dummy")]
-    Dummy
+    Tap
 }
 
 impl fmt::Display for Type {
     fn fmt(&self, formatter: &mut fmt::Formatter) -> Result<(), fmt::Error> {
         match *self {
             Type::Tun => write!(formatter, "tun"),
-            Type::Tap => write!(formatter, "tap"),
-            Type::Dummy => write!(formatter, "dummy")
+            Type::Tap => write!(formatter, "tap")
         }
     }
 }
@@ -70,7 +70,6 @@ impl FromStr for Type {
         Ok(match &text.to_lowercase() as &str {
             "tun" => Self::Tun,
             "tap" => Self::Tap,
-            "dummy" => Self::Dummy,
             _ => return Err("Unknown device type")
         })
     }
@@ -94,7 +93,7 @@ pub trait Device: AsRawFd {
     ///
     /// # Errors
     /// This method will return an error if the underlying read call fails.
-    fn read(&mut self, buffer: &mut [u8]) -> Result<(usize, usize), Error>;
+    fn read(&mut self, buffer: &mut MsgBuffer) -> Result<(), Error>;
 
     /// Writes a packet/frame to the device
     ///
@@ -105,13 +104,15 @@ pub trait Device: AsRawFd {
     ///
     /// # Errors
     /// This method will return an error if the underlying read call fails.
-    fn write(&mut self, data: &mut [u8], start: usize) -> Result<(), Error>;
+    fn write(&mut self, buffer: &mut MsgBuffer) -> Result<(), Error>;
+
+    fn get_ip(&self) -> Result<Ipv4Addr, Error>;
 }
 
 
 /// Represents a tun/tap device
 pub struct TunTapDevice {
-    fd: fs::File,
+    fd: File,
     ifname: String,
     type_: Type
 }
@@ -135,23 +136,23 @@ impl TunTapDevice {
     ///
     /// # Panics
     /// This method panics if the interface name is longer than 31 bytes.
+    #[allow(clippy::useless_conversion)]
     pub fn new(ifname: &str, type_: Type, path: Option<&str>) -> io::Result<Self> {
         let path = path.unwrap_or_else(|| Self::default_path(type_));
-        if type_ == Type::Dummy {
-            return Self::dummy(ifname, path, type_)
-        }
         let fd = fs::OpenOptions::new().read(true).write(true).open(path)?;
         let flags = match type_ {
-            Type::Tun => IFF_TUN | IFF_NO_PI,
-            Type::Tap => IFF_TAP | IFF_NO_PI,
-            Type::Dummy => unreachable!()
+            Type::Tun => libc::IFF_TUN | libc::IFF_NO_PI,
+            Type::Tap => libc::IFF_TAP | libc::IFF_NO_PI
         };
-        let mut ifreq = IfReq::new(ifname, flags as c_short);
-        let res = unsafe { ioctl(fd.as_raw_fd(), TUNSETIFF, &mut ifreq) };
+        let mut ifreq = IfReq::new(ifname);
+        ifreq.data.flags = flags as libc::c_short;
+        let res = unsafe { libc::ioctl(fd.as_raw_fd(), TUNSETIFF.try_into().unwrap(), &mut ifreq) };
         match res {
             0 => {
-                let nul_range_end = ifreq.ifr_name.iter().position(|&c| c == b'\0').unwrap_or(ifreq.ifr_name.len());
-                let ifname = unsafe { str::from_utf8_unchecked(&ifreq.ifr_name[0..nul_range_end]) }.to_string();
+                let mut ifname = String::with_capacity(32);
+                let mut cursor = Cursor::new(ifreq.ifr_name);
+                cursor.read_to_string(&mut ifname)?;
+                ifname = ifname.trim_end_matches('\0').to_owned();
                 Ok(Self { fd, ifname, type_ })
             }
             _ => Err(IoError::last_os_error())
@@ -162,38 +163,13 @@ impl TunTapDevice {
     #[inline]
     pub fn default_path(type_: Type) -> &'static str {
         match type_ {
-            Type::Tun | Type::Tap => "/dev/net/tun",
-            Type::Dummy => "/dev/null"
+            Type::Tun | Type::Tap => "/dev/net/tun"
         }
-    }
-
-    /// Creates a dummy device based on an existing file
-    ///
-    /// This method opens a regular or special file and reads from it to receive packets and
-    /// writes to it to send packets. This method does not use a networking device and therefore
-    /// can be used for testing.
-    ///
-    /// The parameter `path` is the file that should be used. Special files like `/dev/null`,
-    /// named pipes and unix sockets can be used with this method.
-    ///
-    /// Both `ifname` and `type_` parameters have no effect.
-    ///
-    /// # Errors
-    /// This method will return an error if the file can not be opened for reading and writing.
-    #[allow(dead_code)]
-    pub fn dummy(ifname: &str, path: &str, type_: Type) -> io::Result<Self> {
-        Ok(TunTapDevice {
-            fd: fs::OpenOptions::new().create(true).read(true).write(true).open(path)?,
-            ifname: ifname.to_string(),
-            type_
-        })
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[inline]
-    fn correct_data_after_read(&mut self, _buffer: &mut [u8], start: usize, read: usize) -> (usize, usize) {
-        (start, read)
-    }
+    fn correct_data_after_read(&mut self, _buffer: &mut MsgBuffer) {}
 
     #[cfg(any(
         target_os = "bitrig",
@@ -205,21 +181,17 @@ impl TunTapDevice {
         target_os = "openbsd"
     ))]
     #[inline]
-    fn correct_data_after_read(&mut self, buffer: &mut [u8], start: usize, read: usize) -> (usize, usize) {
+    fn correct_data_after_read(&mut self, buffer: &mut MsgBuffer) {
         if self.type_ == Type::Tun {
             // BSD-based systems add a 4-byte header containing the Ethertype for TUN
-            assert!(read >= 4);
-            (start + 4, read - 4)
+            buffer.set_start(buffer.get_start() + 4);
         } else {
-            (start, read)
         }
     }
 
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[inline]
-    fn correct_data_before_write(&mut self, _buffer: &mut [u8], start: usize) -> usize {
-        start
-    }
+    fn correct_data_before_write(&mut self, _buffer: &mut MsgBuffer) {}
 
     #[cfg(any(
         target_os = "bitrig",
@@ -231,20 +203,62 @@ impl TunTapDevice {
         target_os = "openbsd"
     ))]
     #[inline]
-    fn correct_data_before_write(&mut self, buffer: &mut [u8], start: usize) -> usize {
+    fn correct_data_before_write(&mut self, buffer: &mut MsgBuffer) {
         if self.type_ == Type::Tun {
             // BSD-based systems add a 4-byte header containing the Ethertype for TUN
-            assert!(start >= 4);
-            match buffer[start] >> 4 {
+            buffer.set_start(buffer.get_start() - 4);
+            match buffer.message()[4] >> 4 {
                 // IP version
-                4 => buffer[start - 4..start].copy_from_slice(&[0x00, 0x00, 0x08, 0x00]),
-                6 => buffer[start - 4..start].copy_from_slice(&[0x00, 0x00, 0x86, 0xdd]),
+                4 => buffer.message_mut()[0..4].copy_from_slice(&[0x00, 0x00, 0x08, 0x00]),
+                6 => buffer.message_mut()[0..4].copy_from_slice(&[0x00, 0x00, 0x86, 0xdd]),
                 _ => unreachable!()
             }
-            start - 4
-        } else {
-            start
         }
+    }
+
+    pub fn get_overhead(&self) -> usize {
+        40 /* for outer IPv6 header, can't be sure to only have IPv4 peers */
+        + 8 /* for outer UDP header */
+        + crypto::EXTRA_LEN + crypto::TAG_LEN /* crypto overhead */
+        + 1 /* message type header */
+        + match self.type_ {
+            Type::Tap => 14, /* inner ethernet header */
+            Type::Tun => 0
+        }
+    }
+
+    pub fn set_mtu(&self, value: Option<usize>) -> io::Result<()> {
+        let value = match value {
+            Some(value) => value,
+            None => {
+                let default_device = get_default_device()?;
+                get_device_mtu(&default_device)? - self.get_overhead()
+            }
+        };
+        info!("Setting MTU {} on device {}", value, self.ifname);
+        set_device_mtu(&self.ifname, value)
+    }
+
+    pub fn configure(&self, addr: Ipv4Addr, netmask: Ipv4Addr) -> io::Result<()> {
+        set_device_addr(&self.ifname, addr)?;
+        set_device_netmask(&self.ifname, netmask)?;
+        set_device_enabled(&self.ifname, true)
+    }
+
+    pub fn get_rp_filter(&self) -> io::Result<u8> {
+        Ok(cmp::max(get_rp_filter("all")?, get_rp_filter(&self.ifname)?))
+    }
+
+    pub fn fix_rp_filter(&self) -> io::Result<()> {
+        if get_rp_filter("all")? > 1 {
+            info!("Setting net.ipv4.conf.all.rp_filter=1");
+            set_rp_filter("all", 1)?
+        }
+        if get_rp_filter(&self.ifname)? != 1 {
+            info!("Setting net.ipv4.conf.{}.rp_filter=1", self.ifname);
+            set_rp_filter(&self.ifname, 1)?
+        }
+        Ok(())
     }
 }
 
@@ -257,18 +271,24 @@ impl Device for TunTapDevice {
         &self.ifname
     }
 
-    fn read(&mut self, mut buffer: &mut [u8]) -> Result<(usize, usize), Error> {
-        let read = self.fd.read(&mut buffer).map_err(|e| Error::TunTapDev("Read error", e))?;
-        let (start, read) = self.correct_data_after_read(&mut buffer, 0, read);
-        Ok((start, read))
+    fn read(&mut self, buffer: &mut MsgBuffer) -> Result<(), Error> {
+        buffer.clear();
+        let read = self.fd.read(buffer.buffer()).map_err(|e| Error::DeviceIo("Read error", e))?;
+        buffer.set_length(read);
+        self.correct_data_after_read(buffer);
+        Ok(())
     }
 
-    fn write(&mut self, mut data: &mut [u8], start: usize) -> Result<(), Error> {
-        let start = self.correct_data_before_write(&mut data, start);
-        match self.fd.write_all(&data[start..]) {
-            Ok(_) => self.fd.flush().map_err(|e| Error::TunTapDev("Flush error", e)),
-            Err(e) => Err(Error::TunTapDev("Write error", e))
+    fn write(&mut self, buffer: &mut MsgBuffer) -> Result<(), Error> {
+        self.correct_data_before_write(buffer);
+        match self.fd.write_all(buffer.message()) {
+            Ok(_) => self.fd.flush().map_err(|e| Error::DeviceIo("Flush error", e)),
+            Err(e) => Err(Error::DeviceIo("Write error", e))
         }
+    }
+
+    fn get_ip(&self) -> Result<Ipv4Addr, Error> {
+        get_device_addr(&self.ifname).map_err(|e| Error::DeviceIo("Error getting IP address", e))
     }
 }
 
@@ -305,25 +325,31 @@ impl MockDevice {
 
 impl Device for MockDevice {
     fn get_type(&self) -> Type {
-        Type::Dummy
+        Type::Tun
     }
 
     fn ifname(&self) -> &str {
         unimplemented!()
     }
 
-    fn read(&mut self, buffer: &mut [u8]) -> Result<(usize, usize), Error> {
+    fn read(&mut self, buffer: &mut MsgBuffer) -> Result<(), Error> {
         if let Some(data) = self.inbound.pop_front() {
-            buffer[0..data.len()].copy_from_slice(&data);
-            Ok((0, data.len()))
+            buffer.clear();
+            buffer.set_length(data.len());
+            buffer.message_mut().copy_from_slice(&data);
+            Ok(())
         } else {
-            Err(Error::TunTapDev("empty", io::Error::from(ErrorKind::UnexpectedEof)))
+            Err(Error::Device("empty"))
         }
     }
 
-    fn write(&mut self, data: &mut [u8], start: usize) -> Result<(), Error> {
-        self.outbound.push_back(data[start..].to_owned());
+    fn write(&mut self, buffer: &mut MsgBuffer) -> Result<(), Error> {
+        self.outbound.push_back(buffer.message().to_owned());
         Ok(())
+    }
+
+    fn get_ip(&self) -> Result<Ipv4Addr, Error> {
+        Err(Error::Device("Dummy devices have no IP address"))
     }
 }
 
@@ -338,4 +364,142 @@ impl AsRawFd for MockDevice {
     fn as_raw_fd(&self) -> RawFd {
         unimplemented!()
     }
+}
+
+
+#[allow(clippy::useless_conversion)]
+fn set_device_mtu(ifname: &str, mtu: usize) -> io::Result<()> {
+    let sock = UdpSocket::bind("0.0.0.0:0")?;
+    let mut ifreq = IfReq::new(ifname);
+    ifreq.data.value = mtu as libc::c_int;
+    let res = unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFMTU.try_into().unwrap(), &mut ifreq) };
+    match res {
+        0 => Ok(()),
+        _ => Err(IoError::last_os_error())
+    }
+}
+
+#[allow(clippy::useless_conversion)]
+fn get_device_mtu(ifname: &str) -> io::Result<usize> {
+    let sock = UdpSocket::bind("0.0.0.0:0")?;
+    let mut ifreq = IfReq::new(ifname);
+    let res = unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFMTU.try_into().unwrap(), &mut ifreq) };
+    match res {
+        0 => Ok(unsafe { ifreq.data.value as usize }),
+        _ => Err(IoError::last_os_error())
+    }
+}
+
+#[allow(clippy::useless_conversion)]
+fn get_device_addr(ifname: &str) -> io::Result<Ipv4Addr> {
+    let sock = UdpSocket::bind("0.0.0.0:0")?;
+    let mut ifreq = IfReq::new(ifname);
+    let res = unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFADDR.try_into().unwrap(), &mut ifreq) };
+    match res {
+        0 => {
+            let af = unsafe { ifreq.data.addr.0 };
+            if af as libc::c_int != libc::AF_INET {
+                return Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "Invalid address family".to_owned()))
+            }
+            let ip = unsafe { ifreq.data.addr.1 };
+            Ok(ip)
+        }
+        _ => Err(IoError::last_os_error())
+    }
+}
+
+#[allow(clippy::useless_conversion)]
+fn set_device_addr(ifname: &str, addr: Ipv4Addr) -> io::Result<()> {
+    let sock = UdpSocket::bind("0.0.0.0:0")?;
+    let mut ifreq = IfReq::new(ifname);
+    ifreq.data.addr = (libc::AF_INET as libc::c_short, addr);
+    let res = unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFADDR.try_into().unwrap(), &mut ifreq) };
+    match res {
+        0 => Ok(()),
+        _ => Err(IoError::last_os_error())
+    }
+}
+
+#[allow(dead_code)]
+#[allow(clippy::useless_conversion)]
+fn get_device_netmask(ifname: &str) -> io::Result<Ipv4Addr> {
+    let sock = UdpSocket::bind("0.0.0.0:0")?;
+    let mut ifreq = IfReq::new(ifname);
+    let res = unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFNETMASK.try_into().unwrap(), &mut ifreq) };
+    match res {
+        0 => {
+            let af = unsafe { ifreq.data.addr.0 };
+            if af as libc::c_int != libc::AF_INET {
+                return Err(io::Error::new(io::ErrorKind::AddrNotAvailable, "Invalid address family".to_owned()))
+            }
+            let ip = unsafe { ifreq.data.addr.1 };
+            Ok(ip)
+        }
+        _ => Err(IoError::last_os_error())
+    }
+}
+
+#[allow(clippy::useless_conversion)]
+fn set_device_netmask(ifname: &str, addr: Ipv4Addr) -> io::Result<()> {
+    let sock = UdpSocket::bind("0.0.0.0:0")?;
+    let mut ifreq = IfReq::new(ifname);
+    ifreq.data.addr = (libc::AF_INET as libc::c_short, addr);
+    let res = unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFNETMASK.try_into().unwrap(), &mut ifreq) };
+    match res {
+        0 => Ok(()),
+        _ => Err(IoError::last_os_error())
+    }
+}
+
+#[allow(clippy::useless_conversion)]
+fn set_device_enabled(ifname: &str, up: bool) -> io::Result<()> {
+    let sock = UdpSocket::bind("0.0.0.0:0")?;
+    let mut ifreq = IfReq::new(ifname);
+    if unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCGIFFLAGS.try_into().unwrap(), &mut ifreq) } != 0 {
+        return Err(IoError::last_os_error())
+    }
+    if up {
+        unsafe { ifreq.data.value |= libc::IFF_UP | libc::IFF_RUNNING }
+    } else {
+        unsafe { ifreq.data.value &= !libc::IFF_UP }
+    }
+    let res = unsafe { libc::ioctl(sock.as_raw_fd(), libc::SIOCSIFFLAGS.try_into().unwrap(), &mut ifreq) };
+    match res {
+        0 => Ok(()),
+        _ => Err(IoError::last_os_error())
+    }
+}
+
+
+fn get_default_device() -> io::Result<String> {
+    let fd = BufReader::new(File::open("/proc/net/route")?);
+    let mut best = None;
+    for line in fd.lines() {
+        let line = line?;
+        let parts = line.split('\t').collect::<Vec<_>>();
+        if parts[1] == "00000000" {
+            best = Some(parts[0].to_string());
+            break
+        }
+        if parts[2] != "00000000" {
+            best = Some(parts[0].to_string())
+        }
+    }
+    if let Some(ifname) = best {
+        Ok(ifname)
+    } else {
+        Err(io::Error::new(io::ErrorKind::NotFound, "No default interface found".to_string()))
+    }
+}
+
+fn get_rp_filter(device: &str) -> io::Result<u8> {
+    let mut fd = File::open(format!("/proc/sys/net/ipv4/conf/{}/rp_filter", device))?;
+    let mut contents = String::with_capacity(10);
+    fd.read_to_string(&mut contents)?;
+    u8::from_str(contents.trim()).map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "Invalid rp_filter value"))
+}
+
+fn set_rp_filter(device: &str, val: u8) -> io::Result<()> {
+    let mut fd = File::create(format!("/proc/sys/net/ipv4/conf/{}/rp_filter", device))?;
+    writeln!(fd, "{}", val)
 }

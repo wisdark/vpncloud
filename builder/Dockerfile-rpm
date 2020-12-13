@@ -1,13 +1,13 @@
 FROM centos:7
 
 RUN yum groupinstall -y 'Development Tools'
-RUN yum install -y ruby && gem install asciidoctor
+RUN yum install -y ruby && gem install asciidoctor -v 2.0.10
 
 RUN useradd -ms /bin/bash user
 USER user
 WORKDIR /home/user
 
-ENV RUST=1.40.0
+ENV RUST=1.47.0
 
 RUN curl https://sh.rustup.rs -sSf | sh -s -- -y --default-toolchain ${RUST}
 

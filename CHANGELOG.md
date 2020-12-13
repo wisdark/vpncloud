@@ -2,8 +2,46 @@
 
 This project follows [semantic versioning](http://semver.org).
 
-
 ### UNRELEASED
+
+- [removed] Removed dummy device type
+
+### v2.0.1 (2020-11-07)
+
+- [changed] Changed documentation
+- [changed] Updated dependencies
+- [changed] Retrying connections for 120 secs
+- [changed] Resetting own addresses periodically
+- [changed] Using smallvec everywhere
+- [changed] Assume default port for peers without port
+- [fixed] Fixed corner case with lost init message
+- [fixed] Do not reconnect to timed out pending connections
+- [fixed] Most specific claims beat less specific claims
+- [fixed] Count all invalid protocol traffic
+- [fixed] Fixed compile with musl
+- [fixed] Fixed time format in logs
+
+### v2.0.0 (2020-10-30)
+
+- [added] **Add strong crypto, complete rewrite of crypto system**
+- [added] Automatically claim addresses based on interface addresses (disable with --no-auto-claim)
+- [added] Allow to give --ip instead of ifup cmd
+- [added] Automatically set optimal MTU on interface
+- [added] Warning for disabled or loose rp_filter setting
+- [added] Add --fix-rp-filter to fix rp filter settings
+- [added] Offer to migrate old configs
+- [changed] **Complete change of network protocol**
+- [changed] Negotiate crypto method per peer, select best method
+- [changed] Make encryption the default, no encryption must be stated explicitly
+- [changed] Changed default device type to TUN
+- [changed] Rename subnet to claim
+- [changed] Set peer exchange interval to 5 minutes
+- [changed] Periodically send claims with peer list
+- [changed] Changed Rust version to 1.47.0
+- [removed] Remove network-id parameter
+- [removed] Remove port config option in favor of --listen
+
+### UNRELEASED v1.x.y
 
 - [added] Added crypto option AES128
 - [added] Default port for peers
