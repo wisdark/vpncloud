@@ -1,5 +1,5 @@
 // VpnCloud - Peer-to-Peer VPN
-// Copyright (C) 2015-2020  Dennis Schwerdel
+// Copyright (C) 2015-2021  Dennis Schwerdel
 // This software is licensed under GPL-3 or newer (see LICENSE.md)
 
 use std::{
@@ -12,7 +12,7 @@ use std::{
     marker::PhantomData,
     net::{SocketAddr, ToSocketAddrs},
     path::Path,
-    str::FromStr
+    str::FromStr,
 };
 
 use fnv::FnvHasher;
@@ -26,16 +26,17 @@ use crate::{
     device::{Device, Type},
     error::Error,
     messages::{
-        NodeInfo, PeerInfo, MESSAGE_TYPE_CLOSE, MESSAGE_TYPE_DATA, MESSAGE_TYPE_KEEPALIVE, MESSAGE_TYPE_NODE_INFO
+        AddrList, NodeInfo, PeerInfo, MESSAGE_TYPE_CLOSE, MESSAGE_TYPE_DATA, MESSAGE_TYPE_KEEPALIVE,
+        MESSAGE_TYPE_NODE_INFO,
     },
-    net::{mapped_addr, Socket},
+    net::{mapped_addr, parse_listen, Socket},
     payload::Protocol,
     poll::{WaitImpl, WaitResult},
     port_forwarding::PortForwarding,
     table::ClaimTable,
     traffic::TrafficStats,
     types::{Address, Mode, NodeId, Range, RangeList},
-    util::{addr_nice, resolve, CtrlC, Duration, MsgBuffer, StatsdMsg, Time, TimeSource}
+    util::{addr_nice, bytes_to_hex, resolve, CtrlC, Duration, MsgBuffer, StatsdMsg, Time, TimeSource},
 };
 
 pub type Hash = BuildHasherDefault<FnvHasher>;
@@ -47,23 +48,24 @@ const OWN_ADDRESS_RESET_INTERVAL: Time = 300;
 const SPACE_BEFORE: usize = 100;
 
 struct PeerData {
+    addrs: AddrList,
+    #[allow(dead_code)] //TODO: export in status
     last_seen: Time,
     timeout: Time,
     peer_timeout: u16,
     node_id: NodeId,
-    crypto: PeerCrypto<NodeInfo>
+    crypto: PeerCrypto<NodeInfo>,
 }
 
 #[derive(Clone)]
 pub struct ReconnectEntry {
     address: Option<(String, Time)>,
-    resolved: SmallVec<[SocketAddr; 3]>,
+    resolved: AddrList,
     tries: u16,
     timeout: u16,
     next: Time,
-    final_timeout: Option<Time>
+    final_timeout: Option<Time>,
 }
-
 
 pub struct GenericCloud<D: Device, P: Protocol, S: Socket, TS: TimeSource> {
     node_id: NodeId,
@@ -72,7 +74,7 @@ pub struct GenericCloud<D: Device, P: Protocol, S: Socket, TS: TimeSource> {
     broadcast: bool,
     peers: HashMap<SocketAddr, PeerData, Hash>,
     reconnect_peers: SmallVec<[ReconnectEntry; 3]>,
-    own_addresses: SmallVec<[SocketAddr; 3]>,
+    own_addresses: AddrList,
     pending_inits: HashMap<SocketAddr, PeerCrypto<NodeInfo>, Hash>,
     table: ClaimTable<TS>,
     socket: S,
@@ -92,26 +94,22 @@ pub struct GenericCloud<D: Device, P: Protocol, S: Socket, TS: TimeSource> {
     traffic: TrafficStats,
     beacon_serializer: BeaconSerializer<TS>,
     _dummy_p: PhantomData<P>,
-    _dummy_ts: PhantomData<TS>
+    _dummy_ts: PhantomData<TS>,
 }
 
 impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS> {
     #[allow(clippy::too_many_arguments)]
-    pub fn new(config: &Config, device: D, port_forwarding: Option<PortForwarding>, stats_file: Option<File>) -> Self {
-        let socket = match S::listen(config.listen) {
-            Ok(socket) => socket,
-            Err(err) => fail!("Failed to open socket {}: {}", config.listen, err)
-        };
+    pub fn new(
+        config: &Config, socket: S, device: D, port_forwarding: Option<PortForwarding>, stats_file: Option<File>,
+    ) -> Self {
         let (learning, broadcast) = match config.mode {
-            Mode::Normal => {
-                match config.device_type {
-                    Type::Tap => (true, true),
-                    Type::Tun => (false, false)
-                }
-            }
+            Mode::Normal => match config.device_type {
+                Type::Tap => (true, true),
+                Type::Tun => (false, false),
+            },
             Mode::Router => (false, false),
             Mode::Switch => (true, true),
-            Mode::Hub => (false, true)
+            Mode::Hub => (false, true),
         };
         let mut claims = SmallVec::with_capacity(config.claims.len());
         for s in &config.claims {
@@ -124,7 +122,10 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                     info!("Auto-claiming {} due to interface address", range);
                     claims.push(range);
                 }
-                Err(e) => error!("{}", e)
+                Err(Error::DeviceIo(_, e)) if e.kind() == io::ErrorKind::AddrNotAvailable => {
+                    info!("No address set on interface.")
+                }
+                Err(e) => error!("{}", e),
             }
         }
         let now = TS::now();
@@ -159,7 +160,7 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
             crypto,
             config: config.clone(),
             _dummy_p: PhantomData,
-            _dummy_ts: PhantomData
+            _dummy_ts: PhantomData,
         };
         res.initialize();
         res
@@ -189,7 +190,7 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
             match self.socket.send(msg_data.message(), *addr) {
                 Ok(written) if written == msg_data.len() => Ok(()),
                 Ok(_) => Err(Error::Socket("Sent out truncated packet")),
-                Err(e) => Err(Error::SocketIo("IOError when sending", e))
+                Err(e) => Err(Error::SocketIo("IOError when sending", e)),
             }?
         }
         Ok(())
@@ -197,21 +198,23 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
 
     #[inline]
     fn send_to(&mut self, addr: SocketAddr, msg: &mut MsgBuffer) -> Result<(), Error> {
+        // HOT PATH
         debug!("Sending msg with {} bytes to {}", msg.len(), addr);
         self.traffic.count_out_traffic(addr, msg.len());
         match self.socket.send(msg.message(), addr) {
             Ok(written) if written == msg.len() => Ok(()),
             Ok(_) => Err(Error::Socket("Sent out truncated packet")),
-            Err(e) => Err(Error::SocketIo("IOError when sending", e))
+            Err(e) => Err(Error::SocketIo("IOError when sending", e)),
         }
     }
 
     #[inline]
     fn send_msg(&mut self, addr: SocketAddr, type_: u8, msg: &mut MsgBuffer) -> Result<(), Error> {
+        // HOT PATH
         debug!("Sending msg with {} bytes to {}", msg.len(), addr);
         let peer = match self.peers.get_mut(&addr) {
             Some(peer) => peer,
-            None => return Err(Error::Message("Sending to node that is not a peer"))
+            None => return Err(Error::Message("Sending to node that is not a peer")),
         };
         peer.crypto.send_message(type_, msg)?;
         self.send_to(addr, msg)
@@ -219,11 +222,20 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
 
     pub fn reset_own_addresses(&mut self) -> io::Result<()> {
         self.own_addresses.clear();
-        self.own_addresses.push(self.socket.address().map(mapped_addr)?);
+        let socket_addr = self.socket.address().map(mapped_addr)?;
+        // 1) Specified advertise addresses
+        for addr in &self.config.advertise_addresses {
+            self.own_addresses.push(parse_listen(addr, socket_addr.port()));
+        }
+        // 2) Address of UDP socket
+        self.own_addresses.push(socket_addr);
+        // 3) Addresses from port forwarding
         if let Some(ref pfw) = self.port_forwarding {
             self.own_addresses.push(pfw.get_internal_ip().into());
             self.own_addresses.push(pfw.get_external_ip().into());
         }
+        debug!("Own addresses: {:?}", self.own_addresses);
+        // TODO: detect address changes and call event
         Ok(())
     }
 
@@ -237,12 +249,8 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
     ///
     /// This method adds a peer to the list of nodes to reconnect to. A periodic task will try to
     /// connect to the peer if it is not already connected.
-    pub fn add_reconnect_peer(&mut self, mut add: String) {
+    pub fn add_reconnect_peer(&mut self, add: String) {
         let now = TS::now();
-        if add.find(':').unwrap_or(0) <= add.find(']').unwrap_or(0) {
-            // : not present or only in IPv6 address
-            add = format!("{}:{}", add, DEFAULT_PORT)
-        }
         let resolved = match resolve(&add as &str) {
             Ok(addrs) => addrs,
             Err(err) => {
@@ -256,7 +264,7 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
             timeout: 1,
             resolved,
             next: now,
-            final_timeout: None
+            final_timeout: None,
         })
     }
 
@@ -275,8 +283,15 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                 || self.peers.contains_key(addr)
                 || self.pending_inits.contains_key(addr)
             {
-                return Ok(())
+                return Ok(());
             }
+        }
+        if !addrs.is_empty() {
+            self.config.call_hook(
+                "peer_connecting",
+                vec![("PEER", format!("{:?}", addr_nice(addrs[0]))), ("IFNAME", self.device.ifname().to_owned())],
+                true,
+            );
         }
         // Send a message to each resolved address
         for a in addrs {
@@ -288,8 +303,8 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
 
     fn create_node_info(&self) -> NodeInfo {
         let mut peers = smallvec![];
-        for (addr, peer) in &self.peers {
-            peers.push(PeerInfo { node_id: Some(peer.node_id), addrs: smallvec![*addr] })
+        for peer in self.peers.values() {
+            peers.push(PeerInfo { node_id: Some(peer.node_id), addrs: peer.addrs.clone() })
         }
         if peers.len() > 20 {
             let mut rng = rand::thread_rng();
@@ -300,7 +315,8 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
             node_id: self.node_id,
             peers,
             claims: self.claims.clone(),
-            peer_timeout: Some(self.peer_timeout_publish)
+            peer_timeout: Some(self.peer_timeout_publish),
+            addrs: self.own_addresses.clone(),
         }
     }
 
@@ -310,7 +326,7 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
             || self.own_addresses.contains(&addr)
             || self.pending_inits.contains_key(&addr)
         {
-            return Ok(())
+            return Ok(());
         }
         debug!("Connecting to {:?}", addr);
         let payload = self.create_node_info();
@@ -330,7 +346,7 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                 Err(_) => del.push(addr),
                 Ok(MessageResult::None) => (),
                 Ok(MessageResult::Reply) => self.send_to(addr, &mut msg)?,
-                Ok(_) => unreachable!()
+                Ok(_) => unreachable!(),
             }
         }
         for addr in self.peers.keys().copied().collect::<SmallVec<[SocketAddr; 16]>>() {
@@ -339,7 +355,7 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                 Err(_) => del.push(addr),
                 Ok(MessageResult::None) => (),
                 Ok(MessageResult::Reply) => self.send_to(addr, &mut msg)?,
-                Ok(_) => unreachable!()
+                Ok(_) => unreachable!(),
             }
         }
         for addr in del {
@@ -356,7 +372,7 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
         // Connect to those reconnect_peers that are due
         for entry in self.reconnect_peers.clone() {
             if entry.next > now {
-                continue
+                continue;
             }
             self.connect(&entry.resolved as &[SocketAddr])?;
         }
@@ -367,7 +383,7 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                     entry.tries = 0;
                     entry.timeout = 1;
                     entry.next = now + 1;
-                    continue
+                    continue;
                 }
             }
             // Resolve entries anew
@@ -375,19 +391,17 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                 if *next_resolve <= now {
                     match resolve(address as &str) {
                         Ok(addrs) => entry.resolved = addrs,
-                        Err(_) => {
-                            match resolve(&format!("{}:{}", address, DEFAULT_PORT)) {
-                                Ok(addrs) => entry.resolved = addrs,
-                                Err(err) => warn!("Failed to resolve {}: {}", address, err)
-                            }
-                        }
+                        Err(_) => match resolve(&format!("{}:{}", address, DEFAULT_PORT)) {
+                            Ok(addrs) => entry.resolved = addrs,
+                            Err(err) => warn!("Failed to resolve {}: {}", address, err),
+                        },
                     }
                     *next_resolve = now + RESOLVE_INTERVAL;
                 }
             }
             // Ignore if next attempt is already in the future
             if entry.next > now {
-                continue
+                continue;
             }
             // Exponential back-off: every 10 tries, the interval doubles
             entry.tries += 1;
@@ -428,11 +442,6 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
             pfw.check_extend();
         }
         let now = TS::now();
-        // Periodically reset own peers
-        if self.next_own_address_reset <= now {
-            self.reset_own_addresses().map_err(|err| Error::SocketIo("Failed to get own addresses", err))?;
-            self.next_own_address_reset = now + OWN_ADDRESS_RESET_INTERVAL;
-        }
         // Periodically send peer list to peers
         if self.next_peers <= now {
             debug!("Send peer list to all peers");
@@ -463,6 +472,11 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
             self.load_beacon()?;
             self.next_beacon = now + Time::from(self.config.beacon_interval);
         }
+        // Periodically reset own peers
+        if self.next_own_address_reset <= now {
+            self.reset_own_addresses().map_err(|err| Error::SocketIo("Failed to get own addresses", err))?;
+            self.next_own_address_reset = now + OWN_ADDRESS_RESET_INTERVAL;
+        }
         Ok(())
     }
 
@@ -492,7 +506,7 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                 self.beacon_serializer
                     .read_from_cmd(path, Some(50))
                     .map_err(|e| Error::BeaconIo("Failed to call beacon command", e))?;
-                return Ok(())
+                return Ok(());
             } else {
                 peers = self
                     .beacon_serializer
@@ -500,7 +514,7 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                     .map_err(|e| Error::BeaconIo("Failed to read beacon from file", e))?;
             }
         } else {
-            return Ok(())
+            return Ok(());
         }
         debug!("Loaded beacon with peers: {:?}", peers);
         for peer in peers {
@@ -585,7 +599,7 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                 match self.socket.send(msg_data, *addr) {
                     Ok(written) if written == msg_data.len() => Ok(()),
                     Ok(_) => Err(Error::Socket("Sent out truncated packet")),
-                    Err(e) => Err(Error::SocketIo("IOError when sending", e))
+                    Err(e) => Err(Error::SocketIo("IOError when sending", e)),
                 }?
             } else {
                 error!("Failed to resolve statsd server {}", endpoint);
@@ -595,15 +609,18 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
     }
 
     pub fn handle_interface_data(&mut self, data: &mut MsgBuffer) -> Result<(), Error> {
+        // HOT PATH
         let (src, dst) = P::parse(data.message())?;
         debug!("Read data from interface: src: {}, dst: {}, {} bytes", src, dst, data.len());
         self.traffic.count_out_payload(dst, src, data.len());
         match self.table.lookup(dst) {
             Some(addr) => {
+                // HOT PATH
                 // Peer found for destination
                 debug!("Found destination for {} => {}", dst, addr);
                 self.send_msg(addr, MESSAGE_TYPE_DATA, data)?;
                 if !self.peers.contains_key(&addr) {
+                    // COLD PATH
                     // If the peer is not actually connected, remove the entry in the table and try
                     // to reconnect.
                     warn!("Destination for {} not found in peers: {}", dst, addr_nice(addr));
@@ -612,6 +629,7 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                 }
             }
             None => {
+                // COLD PATH
                 if self.broadcast {
                     debug!("No destination for {} found, broadcasting", dst);
                     self.broadcast_msg(MESSAGE_TYPE_DATA, data)?;
@@ -626,14 +644,28 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
 
     fn add_new_peer(&mut self, addr: SocketAddr, info: NodeInfo) -> Result<(), Error> {
         info!("Added peer {}", addr_nice(addr));
+        self.config.call_hook(
+            "peer_connected",
+            vec![
+                ("PEER", format!("{:?}", addr_nice(addr))),
+                ("IFNAME", self.device.ifname().to_owned()),
+                ("CLAIMS", info.claims.iter().map(|r| format!("{:?}", r)).collect::<Vec<String>>().join(" ")),
+                ("NODE_ID", bytes_to_hex(&info.node_id)),
+            ],
+            true,
+        );
         if let Some(init) = self.pending_inits.remove(&addr) {
-            self.peers.insert(addr, PeerData {
-                crypto: init,
-                node_id: info.node_id,
-                peer_timeout: info.peer_timeout.unwrap_or(DEFAULT_PEER_TIMEOUT),
-                last_seen: TS::now(),
-                timeout: TS::now() + self.config.peer_timeout as Time
-            });
+            self.peers.insert(
+                addr,
+                PeerData {
+                    addrs: info.addrs.clone(),
+                    crypto: init,
+                    node_id: info.node_id,
+                    peer_timeout: info.peer_timeout.unwrap_or(DEFAULT_PEER_TIMEOUT),
+                    last_seen: TS::now(),
+                    timeout: TS::now() + self.config.peer_timeout as Time,
+                },
+            );
             self.update_peer_info(addr, Some(info))?;
         } else {
             error!("No init for new peer {}", addr_nice(addr));
@@ -642,9 +674,18 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
     }
 
     fn remove_peer(&mut self, addr: SocketAddr) {
-        if let Some(_peer) = self.peers.remove(&addr) {
+        if let Some(peer) = self.peers.remove(&addr) {
             info!("Closing connection to {}", addr_nice(addr));
             self.table.remove_claims(addr);
+            self.config.call_hook(
+                "peer_disconnected",
+                vec![
+                    ("PEER", format!("{:?}", addr)),
+                    ("IFNAME", self.device.ifname().to_owned()),
+                    ("NODE_ID", bytes_to_hex(&peer.node_id)),
+                ],
+                true,
+            );
         }
     }
 
@@ -652,16 +693,22 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
         'outer: for peer in peers {
             for addr in &peer.addrs {
                 if self.peers.contains_key(addr) {
-                    continue 'outer
+                    continue 'outer;
                 }
             }
             if let Some(node_id) = peer.node_id {
                 if self.node_id == node_id {
-                    continue 'outer
+                    // Check addresses and add addresses that we don't know to own addresses
+                    for addr in &peer.addrs {
+                        if !self.own_addresses.contains(addr) {
+                            self.own_addresses.push(*addr)
+                        }
+                    }
+                    continue 'outer;
                 }
                 for p in self.peers.values() {
                     if p.node_id == node_id {
-                        continue 'outer
+                        continue 'outer;
                     }
                 }
             }
@@ -673,10 +720,20 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
     fn update_peer_info(&mut self, addr: SocketAddr, info: Option<NodeInfo>) -> Result<(), Error> {
         if let Some(peer) = self.peers.get_mut(&addr) {
             peer.last_seen = TS::now();
-            peer.timeout = TS::now() + self.config.peer_timeout as Time
+            peer.timeout = TS::now() + self.config.peer_timeout as Time;
+            if let Some(info) = &info {
+                // Update peer addresses, always add seen address
+                peer.addrs.clear();
+                peer.addrs.push(addr);
+                for addr in &info.addrs {
+                    if !peer.addrs.contains(addr) {
+                        peer.addrs.push(*addr);
+                    }
+                }
+            }
         } else {
             error!("Received peer update from non peer {}", addr_nice(addr));
-            return Ok(())
+            return Ok(());
         }
         if let Some(info) = info {
             debug!("Adding claims of peer {}: {:?}", addr_nice(addr), info.claims);
@@ -688,13 +745,14 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
     }
 
     fn handle_payload_from(&mut self, peer: SocketAddr, data: &mut MsgBuffer) -> Result<(), Error> {
+        // HOT PATH
         let (src, dst) = P::parse(data.message())?;
         let len = data.len();
         debug!("Writing data to device: {} bytes", len);
         self.traffic.count_in_payload(src, dst, len);
         if let Err(e) = self.device.write(data) {
             error!("Failed to send via device: {}", e);
-            return Err(e)
+            return Err(e);
         }
         if self.learning {
             // Learn single address
@@ -704,47 +762,72 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
     }
 
     fn handle_message(
-        &mut self, src: SocketAddr, msg_result: MessageResult<NodeInfo>, data: &mut MsgBuffer
+        &mut self, src: SocketAddr, msg_result: MessageResult<NodeInfo>, data: &mut MsgBuffer,
     ) -> Result<(), Error> {
+        // HOT PATH
         match msg_result {
             MessageResult::Message(type_) => {
+                // HOT PATH
                 match type_ {
-                    MESSAGE_TYPE_DATA => self.handle_payload_from(src, data)?,
+                    MESSAGE_TYPE_DATA => {
+                        // HOT PATH
+                        self.handle_payload_from(src, data)?
+                    }
                     MESSAGE_TYPE_NODE_INFO => {
+                        // COLD PATH
                         let info = match NodeInfo::decode(Cursor::new(data.message())) {
                             Ok(val) => val,
                             Err(err) => {
                                 self.traffic.count_invalid_protocol(data.len());
-                                return Err(err)
+                                return Err(err);
                             }
                         };
                         self.update_peer_info(src, Some(info))?
                     }
-                    MESSAGE_TYPE_KEEPALIVE => self.update_peer_info(src, None)?,
-                    MESSAGE_TYPE_CLOSE => self.remove_peer(src),
+                    MESSAGE_TYPE_KEEPALIVE => {
+                        // COLD PATH
+                        self.update_peer_info(src, None)?
+                    }
+                    MESSAGE_TYPE_CLOSE => {
+                        // COLD PATH
+                        self.remove_peer(src)
+                    }
                     _ => {
+                        // COLD PATH
                         self.traffic.count_invalid_protocol(data.len());
-                        return Err(Error::Message("Unknown message type"))
+                        return Err(Error::Message("Unknown message type"));
                     }
                 }
             }
-            MessageResult::Initialized(info) => self.add_new_peer(src, info)?,
+            MessageResult::Initialized(info) => {
+                // COLD PATH
+                self.add_new_peer(src, info)?
+            }
             MessageResult::InitializedWithReply(info) => {
+                // COLD PATH
                 self.add_new_peer(src, info)?;
                 self.send_to(src, data)?
             }
-            MessageResult::Reply => self.send_to(src, data)?,
-            MessageResult::None => ()
+            MessageResult::Reply => {
+                // COLD PATH
+                self.send_to(src, data)?
+            }
+            MessageResult::None => {
+                // COLD PATH
+            }
         }
         Ok(())
     }
 
     pub fn handle_net_message(&mut self, src: SocketAddr, data: &mut MsgBuffer) -> Result<(), Error> {
+        // HOT PATH
         let src = mapped_addr(src);
         debug!("Received {} bytes from {}", data.len(), src);
         let msg_result = if let Some(init) = self.pending_inits.get_mut(&src) {
+            // COLD PATH
             init.handle_message(data)
         } else if is_init_message(data.message()) {
+            // COLD PATH
             let mut result = None;
             if let Some(peer) = self.peers.get_mut(&src) {
                 if peer.crypto.has_init() {
@@ -758,25 +841,40 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                 let msg_result = init.handle_message(data);
                 match msg_result {
                     Ok(res) => {
+                        self.config.call_hook(
+                            "peer_connecting",
+                            vec![
+                                ("PEER", format!("{:?}", addr_nice(src))),
+                                ("IFNAME", self.device.ifname().to_owned()),
+                            ],
+                            true,
+                        );
                         self.pending_inits.insert(src, init);
                         Ok(res)
                     }
                     Err(err) => {
                         self.traffic.count_invalid_protocol(data.len());
-                        return Err(err)
+                        return Err(err);
                     }
                 }
             }
         } else if let Some(peer) = self.peers.get_mut(&src) {
+            // HOT PATH
             peer.crypto.handle_message(data)
         } else {
+            // COLD PATH
             info!("Ignoring non-init message from unknown peer {}", addr_nice(src));
             self.traffic.count_invalid_protocol(data.len());
-            return Ok(())
+            return Ok(());
         };
+        // HOT PATH
         match msg_result {
-            Ok(val) => self.handle_message(src, val, data),
+            Ok(val) => {
+                // HOT PATH
+                self.handle_message(src, val, data)
+            }
             Err(err) => {
+                // COLD PATH
                 self.traffic.count_invalid_protocol(data.len());
                 Err(err)
             }
@@ -790,26 +888,36 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
     }
 
     fn handle_socket_event(&mut self, buffer: &mut MsgBuffer) {
+        // HOT PATH
         let src = try_fail!(self.socket.receive(buffer), "Failed to read from network socket: {}");
         self.traffic.count_in_traffic(src, buffer.len());
         match self.handle_net_message(src, buffer) {
             Err(e @ Error::CryptoInitFatal(_)) => {
+                // COLD PATH
                 debug!("Fatal crypto init error from {}: {}", src, e);
                 info!("Closing pending connection to {} due to error in crypto init", addr_nice(src));
                 self.pending_inits.remove(&src);
+                self.config.call_hook(
+                    "peer_disconnected",
+                    vec![("PEER", format!("{:?}", addr_nice(src))), ("IFNAME", self.device.ifname().to_owned())],
+                    true,
+                );
             }
             Err(e @ Error::CryptoInit(_)) => {
+                // COLD PATH
                 debug!("Recoverable init error from {}: {}", src, e);
                 info!("Ignoring invalid init message from peer {}", addr_nice(src));
             }
             Err(e) => {
+                // COLD PATH
                 error!("{}", e);
             }
-            Ok(_) => {}
+            Ok(_) => {} // HOT PATH
         }
     }
 
     fn handle_device_event(&mut self, buffer: &mut MsgBuffer) {
+        // HOT PATH
         try_fail!(self.device.read(buffer), "Failed to read from device: {}");
         if let Err(e) = self.handle_interface_data(buffer) {
             error!("{}", e);
@@ -825,12 +933,18 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
     /// Also, this method will call `housekeep` every second.
     pub fn run(&mut self) {
         let ctrlc = CtrlC::new();
-        let waiter = try_fail!(WaitImpl::new(&self.socket, &self.device, 1000), "Failed to setup poll: {}");
+        let waiter = try_fail!(
+            WaitImpl::new(self.socket.as_raw_fd(), self.device.as_raw_fd(), 1000),
+            "Failed to setup poll: {}"
+        );
         let mut buffer = MsgBuffer::new(SPACE_BEFORE);
         let mut poll_error = false;
+        self.config.call_hook("vpn_started", vec![("IFNAME", self.device.ifname())], true);
         for evt in waiter {
+            // HOT PATH
             match evt {
                 WaitResult::Error(err) => {
+                    // COLD PATH
                     if poll_error {
                         fail!("Poll wait failed again: {}", err);
                     }
@@ -839,12 +953,13 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
                 }
                 WaitResult::Timeout => {}
                 WaitResult::Socket => self.handle_socket_event(&mut buffer),
-                WaitResult::Device => self.handle_device_event(&mut buffer)
+                WaitResult::Device => self.handle_device_event(&mut buffer),
             }
             if self.next_housekeep < TS::now() {
+                // COLD PATH
                 poll_error = false;
                 if ctrlc.was_pressed() {
-                    break
+                    break;
                 }
                 if let Err(e) = self.housekeep() {
                     error!("{}", e)
@@ -853,6 +968,7 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
             }
         }
         info!("Shutting down...");
+        self.config.call_hook("vpn_shutdown", vec![("IFNAME", self.device.ifname())], true);
         buffer.clear();
         self.broadcast_msg(MESSAGE_TYPE_CLOSE, &mut buffer).ok();
         if let Some(ref path) = self.config.beacon_store {
@@ -867,10 +983,12 @@ impl<D: Device, P: Protocol, S: Socket, TS: TimeSource> GenericCloud<D, P, S, TS
     }
 }
 
-
-#[cfg(test)] use super::device::MockDevice;
-#[cfg(test)] use super::net::MockSocket;
-#[cfg(test)] use super::util::MockTimeSource;
+#[cfg(test)]
+use super::device::MockDevice;
+#[cfg(test)]
+use super::net::MockSocket;
+#[cfg(test)]
+use super::util::MockTimeSource;
 
 #[cfg(test)]
 impl<P: Protocol> GenericCloud<MockDevice, P, MockSocket, MockTimeSource> {

@@ -1,5 +1,10 @@
+// VpnCloud - Peer-to-Peer VPN
+// Copyright (C) 2015-2021  Dennis Schwerdel
+// This software is licensed under GPL-3 or newer (see LICENSE.md)
+
 use super::{device::Type, types::Mode, util::Duration};
 use crate::config::{ConfigFile, ConfigFileBeacon, ConfigFileDevice, ConfigFileStatsd, CryptoConfig};
+use std::collections::HashMap;
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Clone, Copy)]
 pub enum OldCryptoMethod {
@@ -8,7 +13,7 @@ pub enum OldCryptoMethod {
     #[serde(rename = "aes256")]
     AES256,
     #[serde(rename = "aes128")]
-    AES128
+    AES128,
 }
 
 #[derive(Serialize, Deserialize, Debug, PartialEq, Default)]
@@ -52,7 +57,7 @@ pub struct OldConfigFile {
     #[serde(alias = "statsd-prefix")]
     pub statsd_prefix: Option<String>,
     pub user: Option<String>,
-    pub group: Option<String>
+    pub group: Option<String>,
 }
 
 impl OldConfigFile {
@@ -84,7 +89,7 @@ impl OldConfigFile {
                 interval: self.beacon_interval,
                 load: self.beacon_load,
                 store: self.beacon_store,
-                password: self.shared_key.clone()
+                password: self.shared_key.clone(),
             }),
             claims: self.subnets,
             crypto: CryptoConfig {
@@ -92,18 +97,19 @@ impl OldConfigFile {
                 password: Some(self.shared_key.unwrap_or_else(|| "none".to_string())),
                 private_key: None,
                 public_key: None,
-                trusted_keys: vec![]
+                trusted_keys: vec![],
             },
             device: Some(ConfigFileDevice {
                 fix_rp_filter: None,
                 name: self.device_name,
                 path: self.device_path,
-                type_: self.device_type
+                type_: self.device_type,
             }),
             group: self.group,
             ifdown: self.ifdown,
             ifup: self.ifup,
             ip: None,
+            advertise_addresses: None,
             keepalive: self.keepalive,
             listen: self.listen.or(self.port.map(|p| format!("{}", p))),
             mode: self.mode,
@@ -112,12 +118,11 @@ impl OldConfigFile {
             pid_file: self.pid_file,
             port_forwarding: self.port_forwarding,
             stats_file: self.stats_file,
-            statsd: Some(ConfigFileStatsd {
-                prefix: self.statsd_prefix,
-                server: self.statsd_server
-            }),
+            statsd: Some(ConfigFileStatsd { prefix: self.statsd_prefix, server: self.statsd_server }),
             switch_timeout: self.dst_timeout,
-            user: self.user
+            user: self.user,
+            hook: None,
+            hooks: HashMap::new(),
         }
     }
 }

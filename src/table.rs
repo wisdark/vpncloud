@@ -1,30 +1,28 @@
 // VpnCloud - Peer-to-Peer VPN
-// Copyright (C) 2015-2020  Dennis Schwerdel
+// Copyright (C) 2015-2021  Dennis Schwerdel
 // This software is licensed under GPL-3 or newer (see LICENSE.md)
 
 use fnv::FnvHasher;
 use std::{
-    cmp::min, collections::HashMap, hash::BuildHasherDefault, io, io::Write, marker::PhantomData, net::SocketAddr
+    cmp::min, collections::HashMap, hash::BuildHasherDefault, io, io::Write, marker::PhantomData, net::SocketAddr,
 };
 
 use crate::{
     types::{Address, Range, RangeList},
-    util::{addr_nice, Duration, Time, TimeSource}
+    util::{addr_nice, Duration, Time, TimeSource},
 };
-
 
 type Hash = BuildHasherDefault<FnvHasher>;
 
-
 struct CacheValue {
     peer: SocketAddr,
-    timeout: Time
+    timeout: Time,
 }
 
 struct ClaimEntry {
     peer: SocketAddr,
     claim: Range,
-    timeout: Time
+    timeout: Time,
 }
 
 pub struct ClaimTable<TS: TimeSource> {
@@ -32,7 +30,7 @@ pub struct ClaimTable<TS: TimeSource> {
     cache_timeout: Duration,
     claims: Vec<ClaimEntry>,
     claim_timeout: Duration,
-    _dummy: PhantomData<TS>
+    _dummy: PhantomData<TS>,
 }
 
 impl<TS: TimeSource> ClaimTable<TS> {
@@ -41,7 +39,12 @@ impl<TS: TimeSource> ClaimTable<TS> {
     }
 
     pub fn cache(&mut self, addr: Address, peer: SocketAddr) {
+        // HOT PATH
         self.cache.insert(addr, CacheValue { peer, timeout: TS::now() + self.cache_timeout as Time });
+    }
+
+    pub fn clear_cache(&mut self) {
+        self.cache.clear()
     }
 
     pub fn set_claims(&mut self, peer: SocketAddr, mut claims: RangeList) {
@@ -52,7 +55,7 @@ impl<TS: TimeSource> ClaimTable<TS> {
                     entry.timeout = TS::now() + self.claim_timeout as Time;
                     claims.swap_remove(pos);
                     if claims.is_empty() {
-                        break
+                        break;
                     }
                 } else {
                     entry.timeout = 0
@@ -85,9 +88,11 @@ impl<TS: TimeSource> ClaimTable<TS> {
     }
 
     pub fn lookup(&mut self, addr: Address) -> Option<SocketAddr> {
+        // HOT PATH
         if let Some(entry) = self.cache.get(&addr) {
-            return Some(entry.peer)
+            return Some(entry.peer);
         }
+        // COLD PATH
         let mut found = None;
         let mut prefix_len = -1;
         for entry in &self.claims {
@@ -97,11 +102,11 @@ impl<TS: TimeSource> ClaimTable<TS> {
             }
         }
         if let Some(entry) = found {
-            self.cache.insert(addr, CacheValue {
-                peer: entry.peer,
-                timeout: min(TS::now() + self.cache_timeout as Time, entry.timeout)
-            });
-            return Some(entry.peer)
+            self.cache.insert(
+                addr,
+                CacheValue { peer: entry.peer, timeout: min(TS::now() + self.cache_timeout as Time, entry.timeout) },
+            );
+            return Some(entry.peer);
         }
         None
     }
@@ -149,36 +154,3 @@ impl<TS: TimeSource> ClaimTable<TS> {
 }
 
 // TODO: test
-
-#[cfg(feature = "bench")]
-mod bench {
-    use super::*;
-    use crate::util::MockTimeSource;
-
-    use smallvec::smallvec;
-    use std::str::FromStr;
-    use test::Bencher;
-
-    #[bench]
-    fn lookup_warm(b: &mut Bencher) {
-        let mut table = ClaimTable::<MockTimeSource>::new(60, 60);
-        let addr = Address::from_str("1.2.3.4").unwrap();
-        table.cache(addr, SocketAddr::from_str("1.2.3.4:3210").unwrap());
-        b.iter(|| table.lookup(addr));
-        b.bytes = 1400;
-    }
-
-    #[bench]
-    fn lookup_cold(b: &mut Bencher) {
-        let mut table = ClaimTable::<MockTimeSource>::new(60, 60);
-        let addr = Address::from_str("1.2.3.4").unwrap();
-        table.set_claims(SocketAddr::from_str("1.2.3.4:3210").unwrap(), smallvec![
-            Range::from_str("1.2.3.4/32").unwrap()
-        ]);
-        b.iter(|| {
-            table.cache.clear();
-            table.lookup(addr)
-        });
-        b.bytes = 1400;
-    }
-}

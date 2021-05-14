@@ -1,48 +1,51 @@
-//! This module implements a turn based key rotation.
-//!
-//! The main idea is that both peers periodically create ecdh key pairs and exchange their public keys to create
-//! common key material. There are always two separate ecdh handshakes going on: one initiated by each peer.
-//! However, one handshake is always one step ahead of the other. That means that every message being sent contains a
-//! public key from step 1 of the handshake "proposed key" and a public key from step 2 of the handshake "confirmed
-//! key" (all messages except first message).
-//!
-//! When receiving a message from the peer, the node will create a new ecdh key pair and perform the key
-//! calculation for the proposed key. The peer will store the public key for the confirmation as pending to be
-//! confirmed in the next cycle. Also, if the message contains a confirmation (all but the very first message do),
-//! the node will use the stored private key to perform the ecdh key calculation and emit that key to be used in
-//! the crypto stream.
-//!
-//! Upon each cycle, a node first checks if it still has a proposed key that has not been confirmed by the remote
-//! peer. If so, a message must have been lost and the whole last message including the proposed key as well as the
-//! last confirmed key is being resent. If no proposed key is stored, the node will create a new ecdh key pair, and
-//! store the private key as proposed key. It then sends out a message containing the public key as proposal, as
-//! well as confirming the pending key. This key is also emitted to be added to the crypto stream but not to be
-//! used for encrypting.
-//!
-//! Monotonically increasing message ids guard the communication from message duplication and also serve as
-//! identifiers for the keys to be used in the crypto stream. Since the keys are rotating, the last 2 bits of the
-//! id are enough to identify the key.
-//!
-//! The whole communication is sent via the crypto stream and is therefore encrypted and protected against tampering.
+// VpnCloud - Peer-to-Peer VPN
+// Copyright (C) 2015-2021  Dennis Schwerdel
+// This software is licensed under GPL-3 or newer (see LICENSE.md)
 
-use super::{Error, Key, MsgBuffer};
+// This module implements a turn based key rotation.
+//
+// The main idea is that both peers periodically create ecdh key pairs and exchange their public keys to create
+// common key material. There are always two separate ecdh handshakes going on: one initiated by each peer.
+// However, one handshake is always one step ahead of the other. That means that every message being sent contains a
+// public key from step 1 of the handshake "proposed key" and a public key from step 2 of the handshake "confirmed
+// key" (all messages except first message).
+//
+// When receiving a message from the peer, the node will create a new ecdh key pair and perform the key
+// calculation for the proposed key. The peer will store the public key for the confirmation as pending to be
+// confirmed in the next cycle. Also, if the message contains a confirmation (all but the very first message do),
+// the node will use the stored private key to perform the ecdh key calculation and emit that key to be used in
+// the crypto stream.
+//
+// Upon each cycle, a node first checks if it still has a proposed key that has not been confirmed by the remote
+// peer. If so, a message must have been lost and the whole last message including the proposed key as well as the
+// last confirmed key is being resent. If no proposed key is stored, the node will create a new ecdh key pair, and
+// store the private key as proposed key. It then sends out a message containing the public key as proposal, as
+// well as confirming the pending key. This key is also emitted to be added to the crypto stream but not to be
+// used for encrypting.
+//
+// Monotonically increasing message ids guard the communication from message duplication and also serve as
+// identifiers for the keys to be used in the crypto stream. Since the keys are rotating, the last 2 bits of the
+// id are enough to identify the key.
+//
+// The whole communication is sent via the crypto stream and is therefore encrypted and protected against tampering.
+
+use super::Key;
+use crate::{error::Error, util::MsgBuffer};
 use byteorder::{NetworkEndian, ReadBytesExt, WriteBytesExt};
 use ring::{
     agreement::{agree_ephemeral, EphemeralPrivateKey, UnparsedPublicKey, X25519},
-    rand::SystemRandom
+    rand::SystemRandom,
 };
 use smallvec::{smallvec, SmallVec};
 use std::io::{self, Cursor, Read, Write};
 
-
 type EcdhPublicKey = UnparsedPublicKey<SmallVec<[u8; 96]>>;
 type EcdhPrivateKey = EphemeralPrivateKey;
-
 
 pub struct RotationMessage {
     message_id: u64,
     propose: EcdhPublicKey,
-    confirm: Option<EcdhPublicKey>
+    confirm: Option<EcdhPublicKey>,
 }
 
 impl RotationMessage {
@@ -86,13 +89,13 @@ pub struct RotationState {
     pending: Option<(Key, EcdhPublicKey)>,   // sent by remote, to be confirmed
     proposed: Option<EcdhPrivateKey>,        // my own, proposed but not confirmed
     message_id: u64,
-    timeout: bool
+    timeout: bool,
 }
 
 pub struct RotatedKey {
     pub key: Key,
     pub id: u64,
-    pub use_for_sending: bool
+    pub use_for_sending: bool,
 }
 
 impl RotationState {
@@ -150,7 +153,7 @@ impl RotationState {
 
     pub fn process_message(&mut self, msg: RotationMessage) -> Option<RotatedKey> {
         if msg.message_id <= self.message_id {
-            return None
+            return None;
         }
         debug!("Received rotation message with id {}", msg.message_id);
         self.timeout = false;
@@ -162,7 +165,7 @@ impl RotationState {
         if let Some(peer_key) = msg.confirm {
             if let Some(private_key) = self.proposed.take() {
                 let key = Self::derive_key(private_key, peer_key);
-                return Some(RotatedKey { key, id: msg.message_id, use_for_sending: true })
+                return Some(RotatedKey { key, id: msg.message_id, use_for_sending: true });
             }
         }
         None
@@ -178,7 +181,7 @@ impl RotationState {
                     // Reconfirm last confirmed key
                     Self::send(
                         &RotationMessage { confirm: Some(confirmed_key.clone()), propose: proposed_key, message_id },
-                        out
+                        out,
                     );
                 } else {
                     // First message has been lost
@@ -197,7 +200,7 @@ impl RotationState {
                 self.proposed = Some(private_key);
                 self.confirmed = Some((confirm_key.clone(), message_id));
                 Self::send(&RotationMessage { confirm: Some(confirm_key), propose: propose_key, message_id }, out);
-                return Some(RotatedKey { key, id: message_id, use_for_sending: false })
+                return Some(RotatedKey { key, id: message_id, use_for_sending: false });
             } else {
                 // Nothing pending nor proposed, still waiting to receive message 1
                 // Do nothing, peer will retry
@@ -216,7 +219,7 @@ mod tests {
     impl MsgBuffer {
         fn msg(&mut self) -> Option<RotationMessage> {
             if self.is_empty() {
-                return None
+                return None;
             }
             let msg = RotationMessage::read_from(Cursor::new(self.message())).unwrap();
             self.set_length(0);

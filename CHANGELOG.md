@@ -4,7 +4,31 @@ This project follows [semantic versioning](http://semver.org).
 
 ### UNRELEASED
 
+- [added] Option to specify advertised addresses
+- [added] Peers now learn their own address from peers
+
+### v2.2.0 (2021-04-06)
+
+- [added] Service target file (thanks to mnhauke)
+- [added] Added interactive configuration wizard
+- [added] Support for (un-)installation
+- [added] Building static binaries
+- [added] Building i686 rpm
+- [changed] Restructured example config
+- [changed] Changed Rust version to 1.51.0
+- [changed] Updated dependencies
+- [changed] Change permissions of /etc/vpncloud
+
+### v2.1.0 (2021-02-06)
+
+- [added] Support for websocket proxy mode
+- [added] Support for hook scripts to handle certain situations
+- [added] Support for creating shell completions
 - [removed] Removed dummy device type
+- [changed] Updated dependencies
+- [changed] Changed Rust version to 1.49.0
+- [fixed] Added missing peer address propagation
+- [fixed] Fixed problem with peer addresses without port
 
 ### v2.0.1 (2020-11-07)
 

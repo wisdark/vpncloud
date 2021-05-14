@@ -11,9 +11,7 @@ RUN apt-get update \
     libc6-dev-i386 \
     gcc-5-multilib \
     asciidoctor \
- && rm -rf /var/cache/dpkg
-
-RUN ln -s asm-generic/ /usr/include/asm
+ && apt-get clean && rm -rf /var/lib/apt/lists/*
 
 ADD entrypoint.sh /entrypoint.sh
 

@@ -1,7 +1,10 @@
+// VpnCloud - Peer-to-Peer VPN
+// Copyright (C) 2015-2021  Dennis Schwerdel
+// This software is licensed under GPL-3 or newer (see LICENSE.md)
+
 use thiserror::Error;
 
 use std::io;
-
 
 #[derive(Error, Debug)]
 pub enum Error {
@@ -48,5 +51,5 @@ pub enum Error {
     Parse(&'static str),
 
     #[error("Name can not be resolved: {0}")]
-    NameUnresolvable(String)
+    NameUnresolvable(String),
 }

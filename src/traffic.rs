@@ -1,20 +1,19 @@
 // VpnCloud - Peer-to-Peer VPN
-// Copyright (C) 2018-2020  Dennis Schwerdel
+// Copyright (C) 2015-2021  Dennis Schwerdel
 // This software is licensed under GPL-3 or newer (see LICENSE.md)
 
 use std::{
     collections::HashMap,
     io::{self, Write},
     net::SocketAddr,
-    ops::AddAssign
+    ops::AddAssign,
 };
 
 use super::{
     cloud::{Hash, STATS_INTERVAL},
     types::Address,
-    util::{addr_nice, Bytes}
+    util::{addr_nice, Bytes},
 };
-
 
 #[derive(Default)]
 pub struct TrafficEntry {
@@ -26,7 +25,7 @@ pub struct TrafficEntry {
     pub in_packets_total: usize,
     pub in_bytes: u64,
     pub in_packets: usize,
-    pub idle_periods: usize
+    pub idle_periods: usize,
 }
 
 impl AddAssign<&TrafficEntry> for TrafficEntry {
@@ -72,32 +71,35 @@ impl TrafficEntry {
     }
 }
 
-
 #[derive(Default)]
 pub struct TrafficStats {
     peers: HashMap<SocketAddr, TrafficEntry, Hash>,
     payload: HashMap<(Address, Address), TrafficEntry, Hash>,
-    pub dropped: TrafficEntry
+    pub dropped: TrafficEntry,
 }
 
 impl TrafficStats {
     #[inline]
     pub fn count_out_traffic(&mut self, peer: SocketAddr, bytes: usize) {
+        // HOT PATH
         self.peers.entry(peer).or_insert_with(TrafficEntry::default).count_out(bytes);
     }
 
     #[inline]
     pub fn count_in_traffic(&mut self, peer: SocketAddr, bytes: usize) {
+        // HOT PATH
         self.peers.entry(peer).or_insert_with(TrafficEntry::default).count_in(bytes);
     }
 
     #[inline]
     pub fn count_out_payload(&mut self, remote: Address, local: Address, bytes: usize) {
+        // HOT PATH
         self.payload.entry((remote, local)).or_insert_with(TrafficEntry::default).count_out(bytes);
     }
 
     #[inline]
     pub fn count_in_payload(&mut self, remote: Address, local: Address, bytes: usize) {
+        // HOT PATH
         self.payload.entry((remote, local)).or_insert_with(TrafficEntry::default).count_in(bytes);
     }
 
