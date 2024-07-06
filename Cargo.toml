@@ -1,46 +1,45 @@
 [package]
 name = "vpncloud"
-version = "2.3.0"
+version = "2.4.0"
 authors = ["Dennis Schwerdel <schwerdel@googlemail.com>"]
-build = "build.rs"
 license = "GPL-3.0"
 description = "Peer-to-peer VPN"
 homepage = "https://vpncloud.ddswd.de"
 repository = "https://github.com/dswd/vpncloud"
 keywords = ["vpn", "p2p", "tun", "tap", "network"]
 readme = "README.md"
-edition = "2018"
+edition = "2021"
 
 [package.metadata]
-toolchain = "1.57.0"
-upx_version = "3.96"
+toolchain = "1.75.0"
+upx_version = "4.2.2"
 
 [dependencies]
 chrono = { version = "0.4", features = ["std", "clock"], default_features = false}
 structopt = "0.3"
 serde = { version = "1.0", features = ["derive"] }
-serde_yaml = "0.8"
+serde_yaml = "0.9"
 log = { version = "0.4", features = ["std"] }
 signal = "0.7"
 libc = "0.2"
 rand = "0.8"
 fnv = "1"
 yaml-rust = "0.4"
-daemonize = "0.4"
-ring = "0.16"
+daemonize = "0.5"
+ring = "0.17"
 privdrop = "0.5"
 byteorder = "1.4"
 thiserror = "1.0"
 smallvec = "1.7"
-dialoguer = { version = "0.9", optional = true }
-tungstenite = { version = "0.16", optional = true, default-features = false }
+dialoguer = { version = "0.11", optional = true }
+tungstenite = { version = "0.21", optional = true }
 url = { version = "2.2", optional = true }
 igd = { version = "0.12", optional = true }
 
 
 [dev-dependencies]
 tempfile = "3"
-criterion = { version = "0.3", features = ["html_reports"] }
+criterion = { version = "0.5", features = ["html_reports"] }
 iai = "0.1"
 
 [features]
@@ -60,6 +59,7 @@ harness = false
 
 [profile.release]
 lto = true
+strip = true
 
 [profile.dev]
 lto = false
@@ -89,8 +89,13 @@ assets = [
   ["target/vpncloud.1.gz", "/usr/share/man/man1/vpncloud.1.gz", "644"]
 ]
 
-[package.metadata.rpm.cargo]
-buildflags = ["--release"]
-
-[package.metadata.rpm.targets]
-vpncloud = { path = "/usr/bin/vpncloud" }
+[package.metadata.generate-rpm]
+assets = [
+  { source = "target/release/vpncloud", dest = "/usr/bin/vpncloud", mode = "755" },
+  { source = "assets/example.net.disabled", dest = "/etc/vpncloud/example.net.disabled", mode = "600" },
+  { source = "assets/vpncloud@.service", dest = "/lib/systemd/system/vpncloud@.service", mode = "644" },
+  { source = "assets/vpncloud.target", dest = "/lib/systemd/system/vpncloud.target", mode = "644" },
+  { source = "assets/vpncloud-wsproxy.service", dest = "/lib/systemd/system/vpncloud-wsproxy.service", mode = "644" },
+  { source = "target/vpncloud.1.gz", dest = "/usr/share/man/man1/vpncloud.1.gz", mode = "644" }
+]
+auto-req = "no"

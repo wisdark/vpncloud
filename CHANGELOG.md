@@ -2,6 +2,12 @@
 
 This project follows [semantic versioning](http://semver.org).
 
+### UNRELEASED
+
+- [changed] Changed Rust version to 1.75.0
+- [changed] Updated dependencies
+- [fixed] Fix error when IPv6 is not available
+
 ### v2.3.0 (2021-12-23)
 
 - [added] Added build for armv5te (thanks to xek)
